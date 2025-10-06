@@ -1,0 +1,220 @@
+import re
+from datetime import datetime
+import os
+from docx import Document
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
+import tkinter as tk
+from tkinter import filedialog
+
+
+def choose_file_dialog():
+    root = tk.Tk()
+    root.withdraw()
+
+    filepath = filedialog.askopenfilename(
+        title="Выберите .docx файл для анализа",
+        filetypes=(("Документы Word", "*.docx"), ("Все файлы", "*.*"))
+    )
+
+    return filepath
+
+
+def get_text_from_docx(filename):
+    try:
+        document = Document(filename)
+        full_text = [para.text for para in document.paragraphs]
+        return '\n'.join(full_text)
+    except Exception as e:
+        print(f"Ошибка при чтении файла .docx: {e}")
+        return None
+
+
+def extract_data_from_text(content):
+    if content is None:
+        return None, None, None, None, None, None, None
+
+    ip_pattern = r'\b(?:\d{1,3}(?:\[\.\]|\.)){3}\d{1,3}\b'
+    lst_ips = re.findall(ip_pattern, content)
+
+    link_pattern = r'[\w\d\.-]+\[\.\][\w\d\.-]+'
+    potential_links = re.findall(link_pattern, content)
+
+    lst_links = []
+    for link in potential_links:
+        is_part_of_ip = False
+        for ip in lst_ips:
+            if link in ip:
+                is_part_of_ip = True
+                break
+        if not is_part_of_ip:
+            lst_links.append(link)
+
+    lst_sha256 = re.findall(r'\b[a-fA-F0-9]{64}\b', content)
+    lst_sha1 = re.findall(r'\b[a-fA-F0-9]{40}\b', content)
+
+    all_md5 = re.findall(r'\b[a-fA-F0-9]{32}\b', content)
+    sha_set = set(lst_sha256) | set(lst_sha1)
+    lst_md5 = [h for h in all_md5 if not any(h in s for s in sha_set)]
+
+    lst_filenames = re.findall(r'"([^"]+\.\w+(?:\.\w+)*)"', content)
+
+    lst_emails = re.findall(r'\b[\w\.-]+@[\w\.-]+\[\.\][\w\.-]+\b', content)
+
+    return lst_sha256, lst_md5, lst_links, lst_filenames, lst_ips, lst_sha1, lst_emails
+
+
+def save_data_to_xlsx_formatted(filename, data_dict):
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Индикаторы компрометации"
+
+        grey_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+        bold_font = Font(bold=True)
+        thin_border_side = Side(border_style="thin", color="000000")
+        thin_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side,
+                             bottom=thin_border_side)
+        wrap_alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
+
+        headers = [
+            "№", "Дата\nОтчёта", "Статус\nАктивности\nNTA", "Статус\nАктивности\nSIEM (Tools)",
+            "Статус\nАктивности\nSIEM (MP)", "Тип\nИндикатора", "Индикатор", "IOC",
+            "Бюллетень", "Тип события"
+        ]
+        ws.append(headers)
+        ws.row_dimensions[1].height = 43.2
+
+        indicator_type_map = {
+            "IP": "IP-адрес", "DNS": "Домен", "File": "File", "SHA256": "SHA256",
+            "MD5": "MD5", "SHA1": "SHA1", "Email": "Email"
+        }
+
+        row_counter = 1
+        for data_type, indicators in data_dict.items():
+            if not indicators:
+                continue
+
+            for indicator in indicators:
+                status_nta = "---------------" if data_type == "SHA256" else ""
+                status_siem_mp = "---------------" if data_type == "DNS" else ""
+
+                row_data = [
+                    row_counter, "", status_nta, "---------------", status_siem_mp,
+                    indicator_type_map.get(data_type, data_type), indicator,
+                    indicator.replace('[.]', '.'), "",
+                    "Фишинговая рассылка электронной почты. Вредоносные вложения"
+                ]
+                ws.append(row_data)
+                row_counter += 1
+
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=len(headers)):
+            for cell in row:
+                cell.border = thin_border
+
+        for cell in ws[1]:
+            cell.fill = grey_fill
+            cell.font = bold_font
+            cell.alignment = wrap_alignment
+
+        for row_idx in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row_idx, column=1)
+            cell.fill = grey_fill
+            cell.font = bold_font
+
+        for col in ws.columns:
+            max_length = 0
+            column_letter = col[0].column_letter
+            # Пропускаем первые два столбца, чтобы не делать их слишком широкими
+            if column_letter in ['A', 'B']:
+                ws.column_dimensions[column_letter].width = 15
+                continue
+
+            for cell in col:
+                if cell.value:
+                    # Для заголовков с переносами, ищем самую длинную строку
+                    lines = str(cell.value).split('\n')
+                    cell_max_len = max(len(line) for line in lines)
+                    if cell_max_len > max_length:
+                        max_length = cell_max_len
+
+            adjusted_width = (max_length + 2)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        wb.save(filename)
+        print(f"\nОтформатированный отчет успешно сохранен в файл: {filename}")
+
+    except Exception as e:
+        print(f"\nОшибка при сохранении форматированного файла Excel: {e}")
+
+
+def generate_queries_and_save_txt(filename, data_dict):
+    templates = {
+        "IP": {"MP10": ['src.ip = "{}"', 'dst.ip = "{}"'],
+               "NAD": ['src.ip == "{}"', 'dst.ip == "{}"', 'host.ip == "{}"']},
+        "SHA256": {"MP10": ['object.hash.sha256 = "{}"'], "NAD": []},
+        "MD5": {"MP10": ['object.hash.md5 = "{}"'], "NAD": ['files.md5 == "{}"']},
+        "SHA1": {"MP10": ['object.hash.sha1 = "{}"'], "NAD": []},
+        "DNS": {"MP10": ['event_src.fqdn = "{}"', 'object.fullpath = "{}"', 'object.name = "{}"',
+                         'subject.account.domain = "{}"'],
+                "NAD": ['src.dns ~ "{}"', 'dst.dns ~ "{}"', 'http.rqs.url ~ "{}"', 'dns.query.rrname ~ "{}"']},
+        "File": {"MP10": ['object.name CONTAINS "{}"', 'object.path CONTAINS "{}"', 'object.fullpath = "{}"'],
+                 "NAD": ['files.filename ~ "{}"', 'files.mime ~ "{}"']},
+        "Email": {"MP10": ['subject.account.contact CONTAINS "{}"', 'object.fullpath = "{}"'],
+                  "NAD": ['mail.from == "{}"', 'mail.recipient == "{}"']}
+    }
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            for indicator_type, systems in templates.items():
+                indicator_list = data_dict.get(indicator_type, [])
+                if not indicator_list:
+                    continue
+                f.write(f"--- {{{indicator_type}}} ---\n\n")
+                cleaned_list = [ind.replace('[.]', '.') for ind in indicator_list]
+                if systems.get("MP10"):
+                    f.write("Для MP10\n")
+                    for template in systems["MP10"]:
+                        query_parts = [template.format(ind) for ind in cleaned_list]
+                        f.write(" OR ".join(query_parts) + "\n")
+                    f.write("\n")
+                if systems.get("NAD"):
+                    f.write("Для NAD\n")
+                    for template in systems["NAD"]:
+                        query_parts = [template.format(ind) for ind in cleaned_list]
+                        f.write(" || ".join(query_parts) + "\n")
+                    f.write("\n")
+        print(f"Файл с запросами успешно сохранен: {filename}")
+    except Exception as e:
+        print(f"\nОшибка при сохранении файла с запросами: {e}")
+
+
+def main():
+    print("Открытие окна для выбора файла...")
+    input_file = choose_file_dialog()
+    if not input_file:
+        print("Файл не был выбран. Работа программы завершена.")
+        return
+    print(f"Выбран файл: {input_file}")
+    document_text = get_text_from_docx(input_file)
+    if document_text is None:
+        return
+
+    sha256, md5, links, filenames, ips, sha1, emails = extract_data_from_text(document_text)
+
+    data_to_save = {
+        "SHA256": sha256, "MD5": md5, "SHA1": sha1, "IP": ips,
+        "DNS": links, "File": filenames, "Email": emails
+    }
+
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base_filename = f"итог_{current_time}"
+
+    output_xlsx = f"{base_filename}.xlsx"
+    output_txt = f"{base_filename}_queries.txt"
+
+    save_data_to_xlsx_formatted(output_xlsx, data_to_save)
+    generate_queries_and_save_txt(output_txt, data_to_save)
+
+
+if __name__ == "__main__":
+    main()
