@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 
-# --- КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ (Для хранения значений из GUI) ---
+# --- КОНФИГУРАЦИОННЫЕ ПАРАМЕТРЫ ---
 MIN_WORD_LENGTH = 3
 MIN_RATIO_SCORE = 60
 RATIO_THRESHOLD_2 = 85
@@ -52,17 +52,17 @@ def get_status_from_config(product_string, da_mapping, linux_list, linux_ids, st
     key_s, val_s = check_config_mapping(status_mapping)
     if key_s:
         status, product_id = val_s
-        return status, product_id, "KnownSTATUS Config"
+        return status, product_id, f"KnownSTATUS Config", key_s
 
     key_d, product_id = check_config_mapping(da_mapping)
     if key_d:
-        return "ДА", product_id, "KnownDA Config"
+        return "ДА", product_id, f"KnownDA Config", key_d
 
     for item in linux_list:
         if item and item in clean_product:
-            return "ЛИНУКС", linux_ids, "KnownLINUX Config"
+            return "ЛИНУКС", linux_ids, f"KnownLINUX Config", item
 
-    return "", "", ""
+    return "", "", "", ""
 
 
 def load_and_preprocess_ppts_data(local_path, general_path, cols_l, cols_g):
@@ -235,9 +235,10 @@ def analyze_data(app_instance, config_data):
             app_instance.redirector.update_status(f"Обработано: {index + 1}/{total_rows} строк...")
             product_to_check = str(row.get('Продукт', ''))
 
-            config_status, config_id_ppts, config_source_info = get_status_from_config(
+            config_result = get_status_from_config(
                 product_to_check, known_da_mapping, known_linux_products, known_linux_ids, known_status_mapping
             )
+            config_status, config_id_ppts, config_source_type, config_key_phrase = config_result
 
             status, id_ppts, source_info = "", "", ""
             new_matches_list = find_new_strict_matches(product_to_check, df_ppts)
@@ -245,38 +246,74 @@ def analyze_data(app_instance, config_data):
             final_id_ppts = "-----------"
             final_source_info = ""
 
-            if config_status:
-                if config_status == "ЛИНУКС":
-                    if not new_matches_list:
-                        status = "ЛИНУКС"
-                        final_id_ppts = config_id_ppts
-                        final_source_info = config_source_info
-                    else:
-                        status = ""
+            # --- НОВАЯ ЛОГИКА СТАТУСОВ ---
+
+            status_is_set = False
+            matches_index_4 = [m for m in new_matches_list if m['index'] == 4]
+
+            # 1. СТАТУС "ДА"
+            is_da_config = config_status == "ДА"
+
+            if is_da_config or matches_index_4:
+
+                if (is_da_config and len(matches_index_4) > 0) or (len(matches_index_4) > 1):
+                    status = ""
+                    if new_matches_list:
                         best_match = new_matches_list[0]
                         final_id_ppts = best_match['id']
                         final_source_info = best_match['source']
 
-                elif config_status in ["ДА", "НЕТ"] or config_status.startswith("УСЛОВНО"):
-                    status = config_status
-                    final_id_ppts = config_id_ppts
-                    final_source_info = config_source_info
+                elif len(matches_index_4) == 1:
+                    status = "ДА"
+                    final_id_ppts = matches_index_4[0]['id']
+                    final_source_info = matches_index_4[0]['source']
 
-                else:
-                    status = config_status
+                elif is_da_config:
+                    status = "ДА"
                     final_id_ppts = config_id_ppts
-                    final_source_info = config_source_info
+                    final_source_info = config_source_type
 
-            else:
-                if new_matches_list:
-                    status = ""
-                    best_match = new_matches_list[0]
-                    final_id_ppts = best_match['id']
-                    final_source_info = best_match['source']
+                status_is_set = status != ""
+
+            # 2. СТАТУС "УСЛОВНО"
+            if not status_is_set and config_status and config_status.startswith("УСЛОВНО"):
+                if matches_index_4 and len(matches_index_4) == 1:
+                    status = "УСЛОВНО"
+                    final_id_ppts = config_id_ppts
+                    final_source_info = config_source_type
                 else:
                     status = "НЕТ"
                     final_id_ppts = "-----------"
                     final_source_info = ""
+                status_is_set = True
+
+            # 3. СТАТУС "LINUX"
+            if not status_is_set and config_status == "ЛИНУКС":
+                matches_conflicting = [m for m in new_matches_list if m['index'] >= 2]
+
+                if not matches_conflicting:
+                    status = "ЛИНУКС"
+                    final_id_ppts = config_id_ppts
+                    final_source_info = config_source_type
+
+                elif new_matches_list:
+                    status = ""
+                    best_match = new_matches_list[0]
+                    final_id_ppts = best_match['id']
+                    final_source_info = best_match['source']
+                status_is_set = True
+
+            # 4. СТАТУС "НЕТ" (Финальный отсев)
+            if not status_is_set:
+                if not new_matches_list:
+                    status = "НЕТ"
+                    final_id_ppts = "-----------"
+                    final_source_info = ""
+                else:
+                    status = ""
+                    best_match = new_matches_list[0]
+                    final_id_ppts = best_match['id']
+                    final_source_info = best_match['source']
 
             id_ppts = final_id_ppts if status else ""
             source_info = final_source_info if status else ""
@@ -288,14 +325,20 @@ def analyze_data(app_instance, config_data):
             main_table_data.append(main_row)
 
             detailed_status = config_status if config_status else ("НАЙДЕНО" if new_matches_list else "НЕТ")
-            config_id_for_detailed = f"{config_id_ppts}, Источник: {config_source_info}" if config_source_info.endswith(
-                'Config') else ''
+
+            # --- Обновленный вывод конфига ---
+            if config_status:
+                status_for_detailed = f"{config_status} (Ключ: {config_key_phrase})"
+                id_for_detailed = f"{config_id_ppts} (Источник: {config_source_type})"
+            else:
+                status_for_detailed = ''
+                id_for_detailed = ''
 
             vuln_info_row = {
                 '№': vuln_counter, 'CVE': row.get('CVE', ''), 'CVSS': row.get('CVSS', ''),
                 'Продукт': product_to_check, 'Источник': row.get('Источник', ''),
-                'Статус из конфига': f"{config_status}" if config_source_info.endswith('Config') else '',
-                'ID ППТС из конфига': config_id_for_detailed,
+                'Статус из конфига': status_for_detailed,
+                'ID ППТС из конфига': id_for_detailed,
                 'Matches': new_matches_list,
                 '_status_for_formatting': detailed_status
             }
@@ -308,17 +351,17 @@ def analyze_data(app_instance, config_data):
         index_explanation = {
             'Индекс': [0, 1, 2, 3, 4, ''],
             'Пояснение': ['Нет совпадений (отсечено)',
-                          f'Совпадение на >= {MIN_RATIO_SCORE}% ТОЛЬКО Вендора или ТОЛЬКО Продукта',
-                          f'Совпадение на >= {RATIO_THRESHOLD_2}% ТОЛЬКО Вендора или ТОЛЬКО Продукта',
-                          f'Совпадение на >= {MIN_RATIO_SCORE}% Вендора И Продукта',
-                          f'Совпадение на >= {RATIO_THRESHOLD_2}% Вендора И Продукта',
+                          f'Среднее совпадение на >= {MIN_RATIO_SCORE}% ТОЛЬКО Вендора или ТОЛЬКО Продукта',
+                          f'Среднее совпадение на >= {RATIO_THRESHOLD_2}% ТОЛЬКО Вендора или ТОЛЬКО Продукта',
+                          f'Среднее совпадение на >= {MIN_RATIO_SCORE}% Вендора И Продукта',
+                          f'Среднее совпадение на >= {RATIO_THRESHOLD_2}% Вендора И Продукта',
                           f'Примечание (Индекс вывода >= {MIN_OUTPUT_INDEX})'],
             'Доп. Инфо': ['Выводятся только совпадения с индексом >= {MIN_OUTPUT_INDEX}',
-                          'Максимальный процент совпадения одного слова в поле.',
-                          'Максимальный процент совпадения одного слова в поле.',
-                          'Максимальный процент совпадения одного слова в поле.',
-                          'Максимальный процент совпадения одного слова в поле.',
-                          'Sort: Сортировка внутри индекса происходит по наивысшему проценту совпадения (Вендор или Продукт).']
+                          'Средний процент совпадения слов (считается как среднее от всех совпавших слов с порогом > k%).',
+                          'Средний процент совпадения слов.',
+                          'Средний процент совпадения слов.',
+                          'Средний процент совпадения слов.',
+                          'Sort: Сортировка внутри индекса происходит по наивысшему среднему проценту совпадения (Вендор или Продукт).']
         }
         df_index = pd.DataFrame(index_explanation)
 
@@ -412,7 +455,6 @@ def analyze_data(app_instance, config_data):
             worksheet_detailed.set_column('I:I', 40);
             worksheet_detailed.set_column('J:J', 60);
 
-            # СБРОС ФОРМАТИРОВАНИЯ ДЛЯ СТОЛБЦОВ, НАЧИНАЯ С K (индекс 10)
             worksheet_detailed.set_column('K:XFD', None, None, {'hidden': True})
 
             worksheet_index = writer.sheets['Справка по индексам']
@@ -426,7 +468,6 @@ def analyze_data(app_instance, config_data):
     except Exception as e:
         print(f"\nКРИТИЧЕСКАЯ ОШИБКА: {e}")
     finally:
-        app_instance.redirector.update_status("Готово!")
         app_instance.run_button.config(state=tk.NORMAL)
 
 
@@ -452,11 +493,41 @@ class Application(tk.Tk):
 
         self.redirector = OutputRedirector(self.log_text, self.processing_status)
 
+    def _bind_text_widgets(self, widget):
+        def _copy(event):
+            try:
+                widget.clipboard_clear()
+                widget.clipboard_append(widget.selection_get())
+            except:
+                pass
+            return "break"
+
+        def _paste(event):
+            try:
+                widget.insert(tk.INSERT, widget.clipboard_get())
+            except:
+                pass
+            return "break"
+
+        def _select_all(event):
+            try:
+                widget.tag_add(tk.SEL, "1.0", tk.END)
+                widget.mark_set(tk.INSERT, "1.0")
+            except:
+                pass
+            return "break"
+
+        widget.bind('<Control-c>', _copy)
+        widget.bind('<Control-v>', _paste)
+        widget.bind('<Control-a>', _select_all)
+        widget.bind('<Command-c>', _copy)
+        widget.bind('<Command-v>', _paste)
+        widget.bind('<Command-a>', _select_all)
+
     def create_widgets(self):
         main_frame = tk.Frame(self, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- Левая колонка: Настройки ---
         config_frame = tk.LabelFrame(main_frame, text="Настройки и Файлы", padx=10, pady=10)
         config_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
 
@@ -468,7 +539,7 @@ class Application(tk.Tk):
         self._create_file_selector(file_frame, "ППТС Локал. (Input):", 'file_ppts_local', False)
         self._create_file_selector(file_frame, "ППТС Общий (Input):", 'file_ppts_general', False)
         self._create_file_selector(file_frame, "Конфиг Статусов:", 'status_config_file', False,
-                                   self._load_status_config)
+                                   self._load_status_config, [("Text files", "*.txt"), ("All files", "*.*")])
         self._create_file_selector(file_frame, "Отчет (Output):", 'output_file_path', True)
 
         # 2. Настройки (WordMatching и Columns)
@@ -515,10 +586,12 @@ class Application(tk.Tk):
         tk.Label(config_data_frame, text="[KnownSTATUS] (Статус, ID):").pack(fill=tk.X)
         self.known_status_text = scrolledtext.ScrolledText(config_data_frame, height=5)
         self.known_status_text.pack(fill=tk.X)
+        self._bind_text_widgets(self.known_status_text)
 
         tk.Label(config_data_frame, text="[KnownDA] (ID):").pack(fill=tk.X)
         self.known_da_text = scrolledtext.ScrolledText(config_data_frame, height=5)
         self.known_da_text.pack(fill=tk.X)
+        self._bind_text_widgets(self.known_da_text)
 
         tk.Label(config_data_frame, text="[KnownLINUX] (Products/ID):").pack(fill=tk.X)
         linux_frame = tk.Frame(config_data_frame)
@@ -553,7 +626,7 @@ class Application(tk.Tk):
                                    anchor=tk.W, width=50)
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    def _create_file_selector(self, parent, label_text, var_key, is_save, callback=None):
+    def _create_file_selector(self, parent, label_text, var_key, is_save, callback=None, filetypes=None):
         frame = tk.Frame(parent)
         frame.pack(fill=tk.X, pady=2)
 
@@ -563,10 +636,10 @@ class Application(tk.Tk):
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
         btn_text = "Выбрать..." if not is_save else "Указать путь..."
-        command = lambda: self._select_file(var_key, is_save, callback)
+        command = lambda: self._select_file(var_key, is_save, callback, filetypes)
         tk.Button(frame, text=btn_text, command=command).pack(side=tk.LEFT)
 
-    def _select_file(self, var_key, is_save, callback=None):
+    def _select_file(self, var_key, is_save, callback=None, filetypes=None):
         initial_file = self.file_vars[var_key].get()
         initial_dir = os.path.dirname(initial_file) if initial_file else os.getcwd()
 
@@ -578,9 +651,10 @@ class Application(tk.Tk):
                 initialfile=os.path.basename(initial_file) if initial_file else "output_report.xlsx"
             )
         else:
+            final_filetypes = filetypes if filetypes else [("Excel files", "*.xlsx"), ("All files", "*.*")]
             file_path = filedialog.askopenfilename(
                 initialdir=initial_dir,
-                filetypes=[("Excel files", "*.xlsx"), ("Text files", "*.txt")]
+                filetypes=final_filetypes
             )
 
         if file_path:
@@ -593,26 +667,21 @@ class Application(tk.Tk):
 
         try:
             config_parser = configparser.ConfigParser()
-            # Добавляем фиктивную секцию 'DEFAULT', чтобы избежать ошибки, если в файле нет секций
             config_parser.read_string("[DEFAULT]\n" + open(file_path, 'r', encoding='utf-8').read())
 
-            # Функция для безопасного получения значений
             def get_section_text(section_name):
                 if section_name in config_parser:
                     return "\n".join([f"{k} = {v}" for k, v in config_parser.items(section_name) if k != 'default'])
                 return ""
 
-            # KnownSTATUS
             status_text = get_section_text('KnownSTATUS')
             self.known_status_text.delete('1.0', tk.END)
             self.known_status_text.insert(tk.END, status_text)
 
-            # KnownDA
             da_text = get_section_text('KnownDA')
             self.known_da_text.delete('1.0', tk.END)
             self.known_da_text.insert(tk.END, da_text)
 
-            # KnownLINUX
             if 'KnownLINUX' in config_parser:
                 self.linux_prod_entry.delete(0, tk.END)
                 if 'products' in config_parser['KnownLINUX']:
